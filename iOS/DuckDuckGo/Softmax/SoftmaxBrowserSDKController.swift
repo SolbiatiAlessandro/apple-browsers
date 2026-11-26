@@ -2,15 +2,19 @@
 //  SoftmaxBrowserSDKController.swift
 //  DuckDuckGo (Softmax Browser SDK Fork — surface: "iphone-chromia")
 //
-//  Connects the DuckDuckGo iOS browser to the Softmax Browser SDK & Softmax Cloud Dark Factory (AIDE v3):
-//  - Injects the Softmax universal content runtime (`content-runtime.js`) and active PRDs (`spec_001`..`spec_004`)
-//    into every DuckDuckGo `TabViewController` `WKWebView`.
+//  Connects the DuckDuckGo iOS browser to the Softmax Cloud Dark Factory (AIDE v3 / Fable):
+//  - Injects the Softmax universal content runtime (`content-runtime.js`), active PRDs (`spec_001`..`spec_004`),
+//    and pointer/touch trajectory + DOM event recorder into every DuckDuckGo `TabViewController` `WKWebView`.
+//  - Implements the November 25, 2026 Fable Dark Factory recording bundle:
+//    1. Records full screen/webview frames, microphone audio (`AVAudioRecorder`), and touch/mouse/scroll trajectory events.
+//    2. Exports active `WKHTTPCookieStore` cookies (`WKWebsiteDataStore.default().httpCookieStore.getAllCookies`)
+//       and page storage (`localStorage` / `sessionStorage`) so Fable in the Softmax Dark Factory runs with the
+//       exact same setup, cookies, and login state to one-shot changes.
 //  - Polls `/api/browser/active-features?surface=iphone-chromia` for live PRD updates and Dark Factory build status.
-//  - Provides a floating Softmax Agent & PRDs pill and SwiftUI drawer on `MainViewController` so the user can
-//    talk to the Softmax Voice Agent (`MiniCPM-o-4_5` / `gpt-live-1`), toggle PRDs on iPhone, and send new PRDs
-//    to the Softmax Cloud Dark Factory directly from inside DuckDuckGo iOS.
+//  - Provides a floating Softmax Agent & PRDs pill and SwiftUI drawer on `MainViewController`.
 //
 
+import AVFoundation
 import Combine
 import Foundation
 import SwiftUI
@@ -67,14 +71,14 @@ public struct SoftmaxAgentMessage: Identifiable, Equatable {
 // MARK: - Softmax Browser SDK Runtime Coordinator
 
 @MainActor
-public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
+public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     public static let shared = SoftmaxBrowserSDKCoordinator()
 
     @Published public var prds: [SoftmaxPRDItem] = []
     @Published public var chatMessages: [SoftmaxAgentMessage] = [
         SoftmaxAgentMessage(
             role: "assistant",
-            text: "DuckDuckGo iOS Fork connected to Softmax Cloud Dark Factory (AIDE v3). Talk or type a PRD below, or toggle any PRD on your iPhone."
+            text: "DuckDuckGo iOS Fork connected to Fable in Softmax Cloud Dark Factory (AIDE v3). Record screen + audio + touch/mouse + cookies or type a PRD below."
         )
     ]
     @Published public var agentInputText: String = ""
@@ -82,13 +86,27 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
     @Published public var isPlayingVoice: Bool = false
     @Published public var isConnectingVoice: Bool = false
 
+    // Multimodal Fable Recording State (Video/Screenshare Frames + Audio + Touch/Mouse Trajectory + Cookies)
+    @Published public var isRecordingFableBundle: Bool = false
+    @Published public var recordingElapsedSeconds: Int = 0
+    @Published public var capturedFrameCount: Int = 0
+    @Published public var capturedPointerEventCount: Int = 0
+    @Published public var exportedCookieCount: Int = 0
+
     private var cachedFeaturesJSON: String = "[]"
     private var attachedWebViews = NSHashTable<WKWebView>.weakObjects()
     private var pollTimer: Timer?
+    private var recordingTimer: Timer?
+    private var audioRecorder: AVAudioRecorder?
+    private var recordedAudioFileURL: URL?
+    private var recordedFramesBase64: [[String: Any]] = []
+    private var recordedPointerEvents: [[String: Any]] = []
+    private var recordingStartTimestamp: TimeInterval = 0
+
     public let voiceBridgeWebView: WKWebView
 
     public weak var activeMainViewController: UIViewController?
-    public var activeTabProvider: (() -> (title: String, url: String)?)?
+    public var activeTabProvider: (() -> (title: String, url: String, webView: WKWebView?)?)?
 
     private override init() {
         let voiceConfig = WKWebViewConfiguration()
@@ -114,6 +132,9 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
     // MARK: - WKUserContentController & WKWebView Integration for DuckDuckGo TabViewController
 
     public func installUserScripts(into userContentController: WKUserContentController) {
+        userContentController.removeScriptMessageHandler(forName: "softmaxPointerRecorder")
+        userContentController.add(self, name: "softmaxPointerRecorder")
+
         let bootstrapJS = """
         window.__chromiaIosSurface = true;
         window.__duckDuckGoSoftmaxFork = true;
@@ -124,6 +145,35 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
                 document.documentElement.dataset.softmaxBrowserFork = 'duckduckgo-ios';
             }
         });
+        (function() {
+            if (window.__softmaxPointerHookInstalled) return;
+            window.__softmaxPointerHookInstalled = true;
+            function sendEvent(kind, e) {
+                try {
+                    if (!window.webkit || !window.webkit.messageHandlers || !window.webkit.messageHandlers.softmaxPointerRecorder) return;
+                    var target = e && e.target;
+                    var selector = '';
+                    if (target && target.tagName) {
+                        selector = target.tagName.toLowerCase() + (target.id ? '#' + target.id : '') + (target.className && typeof target.className === 'string' ? '.' + target.className.trim().split(/\\s+/).slice(0, 2).join('.') : '');
+                    }
+                    window.webkit.messageHandlers.softmaxPointerRecorder.postMessage({
+                        kind: kind,
+                        x: (e && (e.clientX ?? (e.touches && e.touches[0] && e.touches[0].clientX))) || 0,
+                        y: (e && (e.clientY ?? (e.touches && e.touches[0] && e.touches[0].clientY))) || 0,
+                        scrollX: window.scrollX || 0,
+                        scrollY: window.scrollY || 0,
+                        selector: selector,
+                        href: location.href,
+                        ts: Date.now()
+                    });
+                } catch (_err) {}
+            }
+            window.addEventListener('pointerdown', function(e) { sendEvent('pointerdown', e); }, { passive: true });
+            window.addEventListener('pointermove', function(e) { sendEvent('pointermove', e); }, { passive: true });
+            window.addEventListener('click', function(e) { sendEvent('click', e); }, { passive: true });
+            window.addEventListener('touchstart', function(e) { sendEvent('touchstart', e); }, { passive: true });
+            window.addEventListener('scroll', function(e) { sendEvent('scroll', e); }, { passive: true });
+        })();
         """
         userContentController.addUserScript(
             WKUserScript(source: bootstrapJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -148,6 +198,14 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
         )
     }
 
+    public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "softmaxPointerRecorder", isRecordingFableBundle else { return }
+        if let body = message.body as? [String: Any] {
+            recordedPointerEvents.append(body)
+            capturedPointerEventCount = recordedPointerEvents.count
+        }
+    }
+
     public func registerWebView(_ webView: WKWebView) {
         attachedWebViews.add(webView)
         injectCachedSpecs(into: webView)
@@ -166,6 +224,208 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
         }
         """
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // MARK: - Asynchronous Multimodal Recording + Cookie/Login Bundle for Fable in Dark Factory (Nov 25, 2026)
+
+    public func toggleFableRecordingBundle() {
+        if isRecordingFableBundle {
+            stopAndSendFableRecordingBundle()
+        } else {
+            startFableRecordingBundle()
+        }
+    }
+
+    public func startFableRecordingBundle() {
+        guard !isRecordingFableBundle else { return }
+        recordedFramesBase64.removeAll()
+        recordedPointerEvents.removeAll()
+        capturedFrameCount = 0
+        capturedPointerEventCount = 0
+        recordingElapsedSeconds = 0
+        recordingStartTimestamp = Date().timeIntervalSince1970
+        isRecordingFableBundle = true
+
+        // Start microphone audio capture
+        let tempDir = FileManager.default.temporaryDirectory
+        let audioURL = tempDir.appendingPathComponent("softmax-fable-request-\(Int(recordingStartTimestamp)).m4a")
+        recordedAudioFileURL = audioURL
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+        try? session.setActive(true)
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
+        ]
+        audioRecorder = try? AVAudioRecorder(url: audioURL, settings: settings)
+        audioRecorder?.record()
+
+        captureCurrentWebViewFrame()
+        recordingTimer?.invalidate()
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isRecordingFableBundle else { return }
+                self.recordingElapsedSeconds += 1
+                self.captureCurrentWebViewFrame()
+            }
+        }
+    }
+
+    private func captureCurrentWebViewFrame() {
+        guard let webView = activeTabProvider?()?.webView else { return }
+        let config = WKSnapshotConfiguration()
+        config.snapshotWidth = 360
+        webView.takeSnapshot(with: config) { [weak self] image, _ in
+            guard let self, let image = image, let jpeg = image.jpegData(compressionQuality: 0.55) else { return }
+            Task { @MainActor in
+                if self.recordedFramesBase64.count < 60 {
+                    self.recordedFramesBase64.append([
+                        "ts": Int(Date().timeIntervalSince1970 * 1000),
+                        "url": webView.url?.absoluteString ?? "",
+                        "jpegBase64": jpeg.base64EncodedString()
+                    ])
+                    self.capturedFrameCount = self.recordedFramesBase64.count
+                }
+            }
+        }
+    }
+
+    public func exportCookiesAndStorageForFable(webView: WKWebView?) async -> (cookies: [[String: Any]], storage: [String: Any]) {
+        let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { list in
+                continuation.resume(returning: list)
+            }
+        }
+        let serializedCookies: [[String: Any]] = cookies.map { c in
+            [
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path,
+                "secure": c.isSecure,
+                "httpOnly": c.isHTTPOnly,
+                "expiresDate": c.expiresDate?.timeIntervalSince1970 ?? 0
+            ]
+        }
+        self.exportedCookieCount = serializedCookies.count
+
+        var storageSnapshot: [String: Any] = [:]
+        if let webView = webView {
+            let storageJS = """
+            (function() {
+                function dump(store) {
+                    var out = {};
+                    try {
+                        for (var i = 0; i < store.length; i++) {
+                            var k = store.key(i);
+                            out[k] = store.getItem(k);
+                        }
+                    } catch (_e) {}
+                    return out;
+                }
+                return JSON.stringify({
+                    origin: location.origin,
+                    href: location.href,
+                    userAgent: navigator.userAgent,
+                    localStorage: dump(window.localStorage),
+                    sessionStorage: dump(window.sessionStorage)
+                });
+            })();
+            """
+            if let raw = try? await webView.evaluateJavaScript(storageJS) as? String,
+               let data = raw.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                storageSnapshot = parsed
+            }
+        }
+        return (cookies: serializedCookies, storage: storageSnapshot)
+    }
+
+    public func stopAndSendFableRecordingBundle() {
+        guard isRecordingFableBundle else { return }
+        isRecordingFableBundle = false
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        audioRecorder?.stop()
+        audioRecorder = nil
+
+        var audioBase64 = ""
+        if let audioURL = recordedAudioFileURL, let audioData = try? Data(contentsOf: audioURL) {
+            audioBase64 = audioData.base64EncodedString()
+        }
+
+        Task { @MainActor in
+            let tabInfo = activeTabProvider?()
+            let authState = await exportCookiesAndStorageForFable(webView: tabInfo?.webView)
+            let summaryNote = agentInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Recorded \(capturedFrameCount) video/screenshare frames, \(recordingElapsedSeconds)s audio, \(capturedPointerEventCount) touch/mouse events, and \(authState.cookies.count) session cookies for Fable."
+                : agentInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+            agentInputText = ""
+
+            chatMessages.append(
+                SoftmaxAgentMessage(
+                    role: "user",
+                    text: "[Fable Dark Factory Bundle] \(summaryNote) (\(capturedFrameCount) frames, \(capturedPointerEventCount) pointer events, \(authState.cookies.count) cookies)"
+                )
+            )
+            isSendingAgentTurn = true
+
+            guard let url = URL(string: "\(SoftmaxBrowserSDKConfig.portalOrigin)/api/browser/chat-turn") else {
+                isSendingAgentTurn = false
+                return
+            }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            let payload: [String: Any] = [
+                "surface": SoftmaxBrowserSDKConfig.surface,
+                "browserFork": "duckduckgo-ios",
+                "targetAgent": "fable-dark-factory",
+                "messages": [
+                    ["role": "user", "content": summaryNote]
+                ],
+                "activeTab": [
+                    "title": tabInfo?.title ?? "",
+                    "url": tabInfo?.url ?? ""
+                ],
+                "fableRecordingBundle": [
+                    "recordedAt": ISO8601DateFormatter().string(from: Date()),
+                    "durationSeconds": recordingElapsedSeconds,
+                    "audioM4aBase64": audioBase64,
+                    "videoFrames": recordedFramesBase64,
+                    "pointerAndMouseEvents": recordedPointerEvents,
+                    "authSession": [
+                        "cookies": authState.cookies,
+                        "webStorage": authState.storage
+                    ]
+                ]
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isSendingAgentTurn = false
+                    if let err = err {
+                        self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: "Error: \(err.localizedDescription)"))
+                        return
+                    }
+                    let reply: String
+                    if let data = data,
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let r = json["reply"] as? String {
+                        reply = r
+                    } else {
+                        reply = "Dispatched recording + cookies bundle to Fable in Softmax Cloud Dark Factory."
+                    }
+                    self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: reply))
+                    self.syncSpecsFromSoftmaxDB()
+                }
+            }.resume()
+        }
     }
 
     // MARK: - Voice Bridge (`/phone?surface=iphone-chromia`)
@@ -295,49 +555,59 @@ public final class SoftmaxBrowserSDKCoordinator: NSObject, ObservableObject, WKN
         chatMessages.append(SoftmaxAgentMessage(role: "user", text: text))
         isSendingAgentTurn = true
 
-        guard let url = URL(string: "\(SoftmaxBrowserSDKConfig.portalOrigin)/api/browser/chat-turn") else {
-            isSendingAgentTurn = false
-            return
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Task { @MainActor in
+            let tabInfo = activeTabProvider?()
+            let authState = await exportCookiesAndStorageForFable(webView: tabInfo?.webView)
 
-        let historyPayload: [[String: String]] = chatMessages.suffix(6).map {
-            ["role": $0.role, "content": $0.text]
-        }
-        let tabInfo = activeTabProvider?()
-        let payload: [String: Any] = [
-            "surface": SoftmaxBrowserSDKConfig.surface,
-            "messages": historyPayload,
-            "activeTab": [
-                "title": tabInfo?.title ?? "",
-                "url": tabInfo?.url ?? ""
-            ]
-        ]
-        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.isSendingAgentTurn = false
-                if let err = err {
-                    self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: "Error: \(err.localizedDescription)"))
-                    return
-                }
-                guard
-                    let data = data,
-                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else {
-                    self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: "Sent PRD to Softmax Cloud Dark Factory."))
-                    self.syncSpecsFromSoftmaxDB()
-                    return
-                }
-                let reply = (json["reply"] as? String) ?? "Sent PRD to Softmax Cloud Dark Factory."
-                self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: reply))
-                self.syncSpecsFromSoftmaxDB()
+            guard let url = URL(string: "\(SoftmaxBrowserSDKConfig.portalOrigin)/api/browser/chat-turn") else {
+                isSendingAgentTurn = false
+                return
             }
-        }.resume()
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            let historyPayload: [[String: String]] = chatMessages.suffix(6).map {
+                ["role": $0.role, "content": $0.text]
+            }
+            let payload: [String: Any] = [
+                "surface": SoftmaxBrowserSDKConfig.surface,
+                "browserFork": "duckduckgo-ios",
+                "targetAgent": "fable-dark-factory",
+                "messages": historyPayload,
+                "activeTab": [
+                    "title": tabInfo?.title ?? "",
+                    "url": tabInfo?.url ?? ""
+                ],
+                "authSession": [
+                    "cookies": authState.cookies,
+                    "webStorage": authState.storage
+                ]
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isSendingAgentTurn = false
+                    if let err = err {
+                        self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: "Error: \(err.localizedDescription)"))
+                        return
+                    }
+                    guard
+                        let data = data,
+                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else {
+                        self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: "Sent PRD + cookies to Fable in Softmax Cloud Dark Factory."))
+                        self.syncSpecsFromSoftmaxDB()
+                        return
+                    }
+                    let reply = (json["reply"] as? String) ?? "Sent PRD + cookies to Fable in Softmax Cloud Dark Factory."
+                    self.chatMessages.append(SoftmaxAgentMessage(role: "assistant", text: reply))
+                    self.syncSpecsFromSoftmaxDB()
+                }
+            }.resume()
+        }
     }
 
     @available(iOS 15.0, *)
@@ -367,24 +637,28 @@ public struct SoftmaxDuckDuckGoAgentSheetView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Softmax Agent & PRDs")
+                    Text("DuckDuckGo · Fable Dark Factory")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundColor(.primary)
-                    Text("DuckDuckGo iOS Fork · Softmax Cloud Dark Factory (AIDE v3)")
+                    Text("Record Video + Audio + Touch + Cookies → One-Shot in Fable")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(.secondary)
                 }
                 Spacer()
-                Button(action: { coordinator.toggleVoicePlayPause() }) {
+                Button(action: { coordinator.toggleFableRecordingBundle() }) {
                     HStack(spacing: 5) {
-                        Image(systemName: coordinator.isPlayingVoice ? "pause.fill" : "mic.fill")
-                            .font(.system(size: 11, weight: .bold))
-                        Text(coordinator.isConnectingVoice ? "Starting…" : (coordinator.isPlayingVoice ? "End Voice" : "Voice Call"))
+                        Image(systemName: coordinator.isRecordingFableBundle ? "stop.circle.fill" : "record.circle")
                             .font(.system(size: 12, weight: .bold))
+                        Text(
+                            coordinator.isRecordingFableBundle
+                                ? "Send (\(coordinator.recordingElapsedSeconds)s · \(coordinator.capturedFrameCount)f)"
+                                : "Record for Fable"
+                        )
+                        .font(.system(size: 12, weight: .bold))
                     }
                     .padding(.horizontal, 11)
                     .padding(.vertical, 6)
-                    .background(coordinator.isPlayingVoice ? Color.red : Color(red: 0.87, green: 0.35, blue: 0.20))
+                    .background(coordinator.isRecordingFableBundle ? Color.red : Color(red: 0.87, green: 0.35, blue: 0.20))
                     .foregroundColor(.white)
                     .clipShape(Capsule())
                 }
@@ -456,7 +730,7 @@ public struct SoftmaxDuckDuckGoAgentSheetView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
 
-                    Text("TALK TO AGENT → SEND TO DARK FACTORY")
+                    Text("SEND VIDEO + AUDIO + TOUCH + COOKIES TO FABLE IN DARK FACTORY")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.secondary)
                         .padding(.horizontal, 4)
@@ -481,7 +755,7 @@ public struct SoftmaxDuckDuckGoAgentSheetView: View {
                             }
                         }
                         if coordinator.isSendingAgentTurn {
-                            Text("Dispatching PRD to Softmax Cloud Dark Factory (AIDE v3)…")
+                            Text("Dispatching recording + cookies to Fable in Softmax Cloud Dark Factory (AIDE v3)…")
                                 .font(.system(size: 11.5, weight: .medium))
                                 .foregroundColor(.blue)
                                 .padding(.horizontal, 6)
@@ -498,7 +772,7 @@ public struct SoftmaxDuckDuckGoAgentSheetView: View {
             Divider()
 
             HStack(spacing: 8) {
-                TextField("Ask agent or send a PRD to Dark Factory…", text: $coordinator.agentInputText, onCommit: {
+                TextField("Describe change for Fable (cookies + session attached)…", text: $coordinator.agentInputText, onCommit: {
                     coordinator.sendPromptToAgentAndDarkFactory()
                 })
                 .textFieldStyle(.plain)
@@ -530,7 +804,7 @@ extension MainViewController {
         coordinator.activeMainViewController = self
         coordinator.activeTabProvider = { [weak self] in
             guard let tab = self?.currentTab else { return nil }
-            return (title: tab.name ?? "", url: tab.url?.absoluteString ?? "")
+            return (title: tab.name ?? "", url: tab.url?.absoluteString ?? "", webView: tab.webView)
         }
 
         // Attach hidden 1x1 voice bridge webview if not yet in hierarchy
@@ -547,7 +821,7 @@ extension MainViewController {
         let button = UIButton(type: .system)
         button.tag = pillTag
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.setTitle("✦ Softmax PRDs", for: .normal)
+        button.setTitle("✦ Softmax · Fable", for: .normal)
         button.titleLabel?.font = UIFont.systemFont(ofSize: 12.5, weight: .bold)
         button.setTitleColor(.white, for: .normal)
         button.backgroundColor = UIColor(red: 0.87, green: 0.35, blue: 0.20, alpha: 0.96)
