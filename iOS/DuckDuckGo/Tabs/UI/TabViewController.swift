@@ -1756,6 +1756,7 @@ class TabViewController: UIViewController {
             replyToUnavailableHandlers: isSitePermissionsEnabled
         )
         userContentController.addUserScript(mediaCaptureUserScript.makeWKUserScriptSync())
+        SoftmaxBrowserSDKCoordinator.shared.installUserScripts(into: userContentController)
         configuration.userContentController = userContentController
         userContentController.delegate = self
 
@@ -1765,6 +1766,7 @@ class TabViewController: UIViewController {
         } else {
             webView = WebView(frame: view.bounds, configuration: configuration)
         }
+        SoftmaxBrowserSDKCoordinator.shared.registerWebView(webView)
         pageSignalsMonitor.attach(to: webView)
         sitePermissionsDidAttachWebView(replacingWebView: isReplacingWebView)
         if floatingUIManager.isFloatingUIEnabled {
@@ -3437,6 +3439,7 @@ extension TabViewController: WKNavigationDelegate {
 
         // Notify Special Error Page Navigation handler that webview successfully finished loading
         specialErrorPageNavigationHandler.handleWebView(webView, didFinish: navigation)
+        SoftmaxBrowserSDKCoordinator.shared.injectCachedSpecs(into: webView)
     }
 
     private func updateFloatingPageBackgroundColor(in webView: WKWebView) {

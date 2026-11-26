@@ -1168,6 +1168,7 @@ class MainViewController: UIViewController {
 
         installContextualSheetDismissGesture()
         remoteMessageImpressionReporter.observeVisibilityChanges()
+        installSoftmaxBrowserSDKPill()
     }
 
     private func configureStartupPresentation() {
